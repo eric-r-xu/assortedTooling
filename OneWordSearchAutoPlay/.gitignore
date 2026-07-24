@@ -1,0 +1,8 @@
+# Local OCR samples generated while the tool is running.
+ocr_letter_templates_oneWordSearch/
+
+# Python and operating-system artifacts.
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
