@@ -1,0 +1,25 @@
+# Operating-system and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Packaging and coverage output
+build/
+dist/
+.coverage
+htmlcov/
+
+# Tool-generated OCR templates
+ocr_letter_templates_oneWordSearch/
+ocr_letter_templates_wordBlitz/

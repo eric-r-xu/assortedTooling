@@ -1,0 +1,3 @@
+# Compatibility install for users accustomed to requirements.txt.
+# Package metadata and dependency versions are maintained in pyproject.toml.
+.

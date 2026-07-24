@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assorted-autoclicker"
+version = "0.1.0"
+description = "A configurable desktop auto-clicker with safe shutdown controls."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Eric Xu" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Desktop Environment",
+]
+dependencies = [
+  "pyautogui>=0.9.54,<0.10",
+]
+
+[project.scripts]
+autoclicker = "auto_clicker:main"
+
+[project.urls]
+Repository = "https://github.com/eric-r-xu/assortedTooling/tree/main/AutoClicker"
+
+[tool.setuptools]
+py-modules = ["auto_clicker"]

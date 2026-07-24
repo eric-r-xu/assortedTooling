@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wordblitz-autoplay"
+version = "0.1.0"
+description = "A computer-vision-assisted solver and auto-player for 4x4 connected-letter games."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Eric Xu" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Games/Entertainment :: Board Games",
+]
+dependencies = [
+  "mss>=10,<11",
+  "numpy>=1.26,<2",
+  "pillow>=10,<12",
+  "pyautogui>=0.9.54,<0.10",
+  "pytesseract>=0.3.13,<0.4",
+  "wordfreq>=3.1,<4",
+  "pyobjc-core>=10,<13; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa>=10,<13; sys_platform == 'darwin'",
+  "pyobjc-framework-Quartz>=10,<13; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+wordblitz-autoplay = "wordBlitz_autoplay:main"
+
+[project.urls]
+Repository = "https://github.com/eric-r-xu/assortedTooling/tree/main/WordBlitzAutoPlay"
+
+[tool.setuptools]
+py-modules = ["wordBlitz_autoplay"]
