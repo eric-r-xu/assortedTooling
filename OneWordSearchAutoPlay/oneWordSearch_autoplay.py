@@ -812,7 +812,8 @@ def looks_like_capital_o(cell_img):
     has_left_right = left_density > 0.10 and right_density > 0.10
     has_top_bottom = top_density > 0.08 and bottom_density > 0.08
     clear_center = center_density < 0.12
-    no_heavy_tail = tail_density < 0.45
+
+    no_heavy_tail = tail_density < 0.75
 
     balanced_sides = abs(left_density - right_density) < 0.20
     balanced_top_bottom = abs(top_density - bottom_density) < 0.20
