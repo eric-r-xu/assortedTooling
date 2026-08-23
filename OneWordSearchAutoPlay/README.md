@@ -140,9 +140,9 @@ pip install -r requirements.txt
 
 ## Running the Auto-Player
 
-Before running the auto-player, **turn off Dark Mode and use Light Mode**. The
-OCR and image-matching settings expect the game to use a light appearance, and
-letter recognition may fail in Dark Mode.
+Both the light and dark game themes are supported. In the dark theme, the
+auto-player locates the 5x5 grid from the regularly spaced white letter bands;
+in the light theme, it retains the existing card-based crop.
 
 ```bash
 python oneWordSearch_autoplay.py
@@ -187,7 +187,7 @@ Most settings are near the top of `oneWordSearch_autoplay.py`.
 ### Capture timing
 
 ```python
-AUTO_CAPTURE_SECONDS = 3
+AUTO_CAPTURE_SECONDS = 1
 ```
 
 Controls how often the script scans the grid.
@@ -196,10 +196,12 @@ Controls how often the script scans the grid.
 
 ```python
 AUTO_TRACE_FOUND_WORD = True
-TRACE_ONLY_FIRST_WORD = True
+TRACE_ONLY_FIRST_WORD = False
 ```
 
-Set `AUTO_TRACE_FOUND_WORD = False` if you only want to detect words without clicking.
+With `TRACE_ONLY_FIRST_WORD = False`, every English word found in a scan is
+traced in sequence. Set `TRACE_ONLY_FIRST_WORD = True` to trace only the first
+match, or set `AUTO_TRACE_FOUND_WORD = False` to detect words without clicking.
 
 ### Template saving
 
@@ -213,11 +215,14 @@ Turn this on to save detected letters for future template matching.
 ### Template matching
 
 ```python
-USE_BACKUP_IMAGE_MATCHING = True
-USE_TEMPLATE_MATCHING_FIRST = True
+USE_BACKUP_IMAGE_MATCHING = False
+USE_TEMPLATE_MATCHING_FIRST = False
 ```
 
-Template matching can improve recognition after the script has collected enough high-confidence letter images.
+Template matching can improve recognition after the script has collected enough
+high-confidence letter images, but it is disabled by default because it makes
+each scan substantially slower. Enable it when OCR accuracy is more important
+than scan speed.
 
 ---
 

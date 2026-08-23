@@ -14,7 +14,7 @@ from wordfreq import zipf_frequency
 
 
 GRID_SIZE = 5
-AUTO_CAPTURE_SECONDS = 3
+AUTO_CAPTURE_SECONDS = 1
 
 CAPTURE_REGION = {
     "left": 200,
@@ -34,21 +34,42 @@ GUIDE_MOVE_STEP = 1
 GUIDE_FAST_MOVE_STEP = 10
 
 # OCR settings
-FAST_THRESHOLDS = ["otsu", 190]
-FALLBACK_THRESHOLDS = ["otsu", 160, 210]
+FAST_THRESHOLDS = ["otsu"]
+FALLBACK_THRESHOLDS = ["otsu"]
+
+# White-letter isolation settings. The game can draw white letters over
+# differently colored tiles, so color and saturation should not become part of
+# the glyph passed to OCR. These values deliberately include anti-aliased edge
+# pixels, not just pure #FFFFFF pixels.
+WHITE_TEXT_MIN_SCORE = 130
+WHITE_TEXT_MAX_CHROMA = 110
+WHITE_TEXT_MIN_COVERAGE = 0.003
+WHITE_TEXT_MAX_COVERAGE = 0.40
+
+# Dark-board grid detection. On the dark game theme the card itself contains
+# no large white area, so auto_crop_white_card() would mistake the letters for
+# the card boundaries. Instead, five regularly spaced bands of neutral-white
+# pixels reveal the row and column centers directly.
+DARK_GRID_WHITE_MIN = 180
+DARK_GRID_WHITE_MAX_CHROMA = 40
+DARK_GRID_PROJECTION_FRACTION = 0.05
+DARK_GRID_MAX_SPACING_VARIATION = 0.15
 
 PSM_MODES_FAST = [10]
-PSM_MODES_FALLBACK = [10, 13]
+# PSM 13 is retained as the single fallback because the game's R glyph is not
+# recognized reliably by PSM 10. Repeating thresholds is unnecessary after
+# white-letter isolation has already produced a binary image.
+PSM_MODES_FALLBACK = [13]
 
 ASK_FOR_UNKNOWN_CELLS = False
 SAVE_FAILED_CELLS = False
 
 # Template-saving settings
-SAVE_TEMPLATE_IMAGES = True
+SAVE_TEMPLATE_IMAGES = False
 TEMPLATE_IMAGE_ROOT = "ocr_letter_templates_oneWordSearch"
 
-USE_BACKUP_IMAGE_MATCHING = True
-USE_TEMPLATE_MATCHING_FIRST = True
+USE_BACKUP_IMAGE_MATCHING = False
+USE_TEMPLATE_MATCHING_FIRST = False
 BACKUP_IMAGE_ROOT = os.path.join(TEMPLATE_IMAGE_ROOT, "high_confidence")
 BACKUP_MATCH_WHEN_CONF_BELOW = 65
 BACKUP_MATCH_THRESHOLD = 0.72
@@ -65,15 +86,15 @@ SAVE_ORIGINAL_TEMPLATE_IMAGE = False
 
 # Auto-click/trace settings
 AUTO_TRACE_FOUND_WORD = True
-TRACE_ONLY_FIRST_WORD = True
+TRACE_ONLY_FIRST_WORD = False
 
-TRACE_MOVE_DURATION = 0.12
-TRACE_DRAG_DURATION = 0.18
-TRACE_PAUSE_AFTER_WORD = 0.5
+TRACE_MOVE_DURATION = 0.04
+TRACE_DRAG_DURATION = 0.06
+TRACE_PAUSE_AFTER_WORD = 0.20
 
 # Move mouse to top-left corner to abort pyautogui actions
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.03
+pyautogui.PAUSE = 0.01
 
 # Allow 0 because Tesseract often reads round O as zero.
 # We map 0 back to O later.
@@ -455,10 +476,83 @@ def auto_crop_white_card(img):
     return cropped
 
 
-def otsu_threshold(gray_img):
-    arr = np.array(gray_img)
+def _find_projection_centers(projection):
+    """Return centers of the five substantial runs in a 1-D projection."""
+    if projection.size == 0 or projection.max() <= 0:
+        return None
 
-    hist, _ = np.histogram(arr.flatten(), bins=256, range=(0, 256))
+    minimum = max(3, projection.max() * DARK_GRID_PROJECTION_FRACTION)
+    active = np.flatnonzero(projection >= minimum)
+    if active.size == 0:
+        return None
+
+    runs = []
+    start = previous = int(active[0])
+    for coordinate in active[1:]:
+        coordinate = int(coordinate)
+        if coordinate > previous + 1:
+            runs.append((start, previous))
+            start = coordinate
+        previous = coordinate
+    runs.append((start, previous))
+
+    # Single-pixel noise can otherwise create extra bands near the board.
+    runs = [(start, end) for start, end in runs if end - start + 1 >= 3]
+    if len(runs) != GRID_SIZE:
+        return None
+
+    centers = np.array(
+        [(start + end) / 2.0 for start, end in runs],
+        dtype=np.float64,
+    )
+    spacings = np.diff(centers)
+    median_spacing = float(np.median(spacings))
+    if median_spacing <= 0:
+        return None
+
+    spacing_error = np.max(np.abs(spacings - median_spacing)) / median_spacing
+    if spacing_error > DARK_GRID_MAX_SPACING_VARIATION:
+        return None
+
+    return centers
+
+
+def detect_dark_grid_centers(img):
+    """Detect 5x5 centers from white glyphs on the game's dark theme.
+
+    Returns ``(x_centers, y_centers)`` in image coordinates, or ``None`` when
+    the image does not contain a convincing regularly spaced dark-theme grid.
+    """
+    rgb = np.asarray(img.convert("RGB"), dtype=np.int16)
+    channel_min = rgb.min(axis=2)
+    chroma = rgb.max(axis=2) - channel_min
+    white_glyphs = (
+        (channel_min >= DARK_GRID_WHITE_MIN)
+        & (chroma <= DARK_GRID_WHITE_MAX_CHROMA)
+    )
+
+    x_centers = _find_projection_centers(white_glyphs.sum(axis=0))
+    y_centers = _find_projection_centers(white_glyphs.sum(axis=1))
+    if x_centers is None or y_centers is None:
+        return None
+
+    # A real 5x5 board should occupy most of the selected capture region.
+    height, width = white_glyphs.shape
+    if (
+        x_centers[-1] - x_centers[0] < width * 0.50
+        or y_centers[-1] - y_centers[0] < height * 0.50
+    ):
+        return None
+
+    return x_centers, y_centers
+
+
+def otsu_threshold(gray_img):
+    # Grayscale pixels are integers in the inclusive range 0..255.  bincount
+    # gives us those exact 256 bins and avoids a NumPy histogram edge-case
+    # seen with uint8 images on newer Python versions.
+    arr = np.asarray(gray_img, dtype=np.uint8)
+    hist = np.bincount(arr.ravel(), minlength=256)
     total = arr.size
 
     sum_total = np.dot(np.arange(256), hist)
@@ -532,6 +626,46 @@ def pad_to_square(img, fill=255):
     return square
 
 
+def isolate_white_letters(cell_img):
+    """Return white glyphs as black ink and flatten every other color.
+
+    A pixel's score is driven mostly by its darkest RGB channel. This prevents
+    bright saturated tile colors from looking white, while the chroma allowance
+    keeps anti-aliased letter edges that have blended with the tile color.
+    The relative threshold also lets white text remain detectable on light gray
+    tiles. ``None`` means the cell does not look like a white-on-color cell, so
+    the legacy dark-letter cleanup should be used instead.
+    """
+    rgb = np.asarray(cell_img.convert("RGB"), dtype=np.int16)
+    channel_min = rgb.min(axis=2)
+    channel_max = rgb.max(axis=2)
+    chroma = channel_max - channel_min
+
+    white_score = channel_min - (0.15 * chroma)
+    background_score = float(np.median(white_score))
+    brightest_score = float(np.percentile(white_score, 99))
+
+    # Require pixels to be both absolutely light and noticeably closer to
+    # white than the cell's dominant color.
+    relative_margin = max(10.0, (brightest_score - background_score) * 0.20)
+    score_threshold = max(
+        float(WHITE_TEXT_MIN_SCORE),
+        background_score + relative_margin,
+    )
+    white_mask = (
+        (white_score >= score_threshold)
+        & (chroma <= WHITE_TEXT_MAX_CHROMA)
+    )
+
+    coverage = float(white_mask.mean())
+    if not (WHITE_TEXT_MIN_COVERAGE <= coverage <= WHITE_TEXT_MAX_COVERAGE):
+        return None
+
+    # OCR expects dark ink on a white background.
+    flattened = np.where(white_mask, 0, 255).astype(np.uint8)
+    return Image.fromarray(flattened, mode="L")
+
+
 def clean_cell_for_ocr(cell_img, threshold="otsu"):
     w, h = cell_img.size
 
@@ -547,18 +681,25 @@ def clean_cell_for_ocr(cell_img, threshold="otsu"):
         )
     )
 
-    gray = ImageOps.grayscale(cell_img)
+    white_letters = isolate_white_letters(cell_img)
 
-    gray = ImageOps.autocontrast(gray)
-    gray = ImageEnhance.Contrast(gray).enhance(3.5)
-    gray = gray.filter(ImageFilter.SHARPEN)
-
-    if threshold == "otsu":
-        threshold_value = otsu_threshold(gray)
+    if white_letters is not None:
+        # Color has already been reduced to a binary white-letter mask. Keep it
+        # independent of the requested grayscale threshold used by OCR retries.
+        bw = white_letters
     else:
-        threshold_value = int(threshold)
+        gray = ImageOps.grayscale(cell_img)
 
-    bw = gray.point(lambda p: 0 if p < threshold_value else 255)
+        gray = ImageOps.autocontrast(gray)
+        gray = ImageEnhance.Contrast(gray).enhance(3.5)
+        gray = gray.filter(ImageFilter.SHARPEN)
+
+        if threshold == "otsu":
+            threshold_value = otsu_threshold(gray)
+        else:
+            threshold_value = int(threshold)
+
+        bw = gray.point(lambda p: 0 if p < threshold_value else 255)
 
     bw = bw.filter(ImageFilter.MedianFilter(size=3))
     bw = crop_to_letter_bounds(bw)
@@ -655,6 +796,7 @@ def looks_like_capital_p(cell_img):
 
     upper_right_bowl = letter[8:34, 34:64]
     mid_right_bowl = letter[18:42, 34:64]
+    right_bowl_bridge = letter[12:25, 50:64]
 
     lower_right = letter[42:64, 28:64]
     lower_left = letter[42:64, 0:22]
@@ -667,6 +809,7 @@ def looks_like_capital_p(cell_img):
     middle_bar_density = middle_bar.mean()
     upper_right_bowl_density = upper_right_bowl.mean()
     mid_right_bowl_density = mid_right_bowl.mean()
+    right_bowl_bridge_density = right_bowl_bridge.mean()
     lower_right_density = lower_right.mean()
     lower_left_density = lower_left.mean()
     far_right_upper_density = far_right_upper.mean()
@@ -687,6 +830,9 @@ def looks_like_capital_p(cell_img):
         upper_right_bowl_density > 0.08
         and mid_right_bowl_density > 0.06
         and far_right_upper_density > 0.05
+        # Unlike F's two disconnected horizontal bars, P has a right-side
+        # curve joining its top and middle strokes.
+        and right_bowl_bridge_density > 0.08
         and upper_right_stronger_than_lower
     )
 
@@ -731,34 +877,29 @@ def looks_like_capital_f(cell_img):
     middle_bar = letter[24:42, 0:52]
     lower_left = letter[42:64, 0:22]
 
-    upper_right_bowl = letter[8:34, 34:64]
-    far_right_upper = letter[10:34, 50:64]
+    right_bowl_bridge = letter[12:25, 50:64]
     far_right_lower = letter[42:64, 50:64]
     lower_right = letter[42:64, 28:64]
-    bottom_bar = letter[48:64, 0:52]
+    bottom_right_bar = letter[48:64, 24:56]
 
     left_stem_density = left_stem.mean()
     top_bar_density = top_bar.mean()
     middle_bar_density = middle_bar.mean()
     lower_left_density = lower_left.mean()
-    upper_right_bowl_density = upper_right_bowl.mean()
-    far_right_upper_density = far_right_upper.mean()
+    right_bowl_bridge_density = right_bowl_bridge.mean()
     far_right_lower_density = far_right_lower.mean()
     lower_right_density = lower_right.mean()
-    bottom_bar_density = bottom_bar.mean()
+    bottom_right_bar_density = bottom_right_bar.mean()
 
     has_left_stem = left_stem_density > 0.22
     has_top_bar = top_bar_density > 0.12
     has_middle_bar = middle_bar_density > 0.10
     has_lower_stem = lower_left_density > 0.08
 
-    no_upper_bowl = (
-        upper_right_bowl_density < 0.14
-        and far_right_upper_density < 0.07
-    )
+    no_upper_bowl = right_bowl_bridge_density < 0.05
     lower_right_clear = lower_right_density < 0.08
     far_right_lower_clear = far_right_lower_density < 0.05
-    no_bottom_bar = bottom_bar_density < 0.13
+    no_bottom_bar = bottom_right_bar_density < 0.05
 
     return (
         has_left_stem
@@ -828,6 +969,58 @@ def looks_like_capital_o(cell_img):
         and balanced_top_bottom
         and rounded_corners
     )
+
+
+def looks_like_capital_o_misread_as_t(cell_img):
+    """Distinguish a chunky O from Tesseract's occasional T prediction.
+
+    The normal O detector is deliberately strict because it is also used for
+    unknown, C, D, and Q predictions.  In the much narrower T-vs-O case we can
+    accept the game's squarer O: its empty center and continuous strokes on all
+    four sides are features a real capital T cannot have.
+    """
+    letter, aspect_ratio = get_normalized_letter_mask(
+        cell_img,
+        threshold="otsu",
+        dark_cutoff=90
+    )
+
+    if letter is None or not (0.70 <= aspect_ratio <= 1.30):
+        return False
+
+    left_density = letter[:, 0:16].mean()
+    right_density = letter[:, 48:64].mean()
+    top_density = letter[0:16, :].mean()
+    bottom_density = letter[48:64, :].mean()
+    center_density = letter[22:42, 22:42].mean()
+    lower_right_density = letter[42:64, 42:64].mean()
+
+    corner_densities = [
+        letter[0:16, 0:16].mean(),
+        letter[0:16, 48:64].mean(),
+        letter[48:64, 0:16].mean(),
+        letter[48:64, 48:64].mean()
+    ]
+
+    return (
+        left_density > 0.10
+        and right_density > 0.10
+        and top_density > 0.08
+        and bottom_density > 0.08
+        and center_density < 0.12
+        and lower_right_density < 0.85
+        and abs(left_density - right_density) < 0.20
+        and abs(top_density - bottom_density) < 0.20
+        and max(corner_densities) < 0.72
+    )
+
+
+def correct_t_o_confusion(cell_img, letter, confidence):
+    """Override a T result only when the pixels clearly form a closed O."""
+    if letter == "T" and looks_like_capital_o_misread_as_t(cell_img):
+        return "O", 96
+
+    return letter, confidence
 
 
 
@@ -1067,7 +1260,7 @@ def ocr_attempt(cell_img, thresholds, psm_modes):
 def ocr_single_letter(cell_img):
     template_letter, template_conf = maybe_use_template_image_match_first(cell_img)
     if template_letter is not None:
-        return template_letter, template_conf
+        return correct_t_o_confusion(cell_img, template_letter, template_conf)
 
     if looks_like_capital_i(cell_img):
         return "I", 99
@@ -1077,6 +1270,10 @@ def ocr_single_letter(cell_img):
         FAST_THRESHOLDS,
         PSM_MODES_FAST
     )
+
+    corrected_letter, corrected_conf = correct_t_o_confusion(cell_img, letter, conf)
+    if corrected_letter != letter:
+        return corrected_letter, corrected_conf
 
     if letter in {"?", "D", "C", "Q"} or conf < 70:
         if looks_like_capital_o(cell_img):
@@ -1105,6 +1302,14 @@ def ocr_single_letter(cell_img):
         FALLBACK_THRESHOLDS,
         PSM_MODES_FALLBACK
     )
+
+    corrected_letter2, corrected_conf2 = correct_t_o_confusion(
+        cell_img,
+        letter2,
+        conf2
+    )
+    if corrected_letter2 != letter2:
+        return corrected_letter2, corrected_conf2
 
     if letter2 in {"?", "D", "C", "Q"} or conf2 < 70:
         if looks_like_capital_o(cell_img):
@@ -1190,6 +1395,31 @@ def save_letter_template_images(cell_img, letter, confidence, row, col):
 
 
 def split_grid_into_cells(img, capture_region=None):
+    dark_grid_centers = detect_dark_grid_centers(img)
+    if dark_grid_centers is not None:
+        x_centers, y_centers = dark_grid_centers
+        cell_w = float(np.median(np.diff(x_centers)))
+        cell_h = float(np.median(np.diff(y_centers)))
+        cells = []
+        cell_centers_screen = {}
+        screen_left = capture_region["left"] if capture_region else 0
+        screen_top = capture_region["top"] if capture_region else 0
+
+        for row, center_y in enumerate(y_centers):
+            for col, center_x in enumerate(x_centers):
+                left = max(0, int(round(center_x - cell_w / 2)))
+                top = max(0, int(round(center_y - cell_h / 2)))
+                right = min(img.width, int(round(center_x + cell_w / 2)))
+                bottom = min(img.height, int(round(center_y + cell_h / 2)))
+
+                cells.append((row, col, img.crop((left, top, right, bottom))))
+                cell_centers_screen[(row, col)] = (
+                    int(round(screen_left + center_x)),
+                    int(round(screen_top + center_y)),
+                )
+
+        return cells, cell_centers_screen
+
     img, crop_left, crop_top = auto_crop_white_card_with_offset(img)
 
     width, height = img.size
@@ -1379,17 +1609,20 @@ def trace_word_on_screen(word_item, cell_centers_screen):
         duration=TRACE_MOVE_DURATION
     )
 
-    pyautogui.mouseDown()
-
-    for x, y in points[1:]:
-        pyautogui.dragTo(
-            x,
-            y,
-            duration=TRACE_DRAG_DURATION,
-            button="left"
-        )
-
-    pyautogui.mouseUp()
+    # Keep one uninterrupted press across the entire word. pyautogui.dragTo()
+    # manages its own press/release cycle, so calling it once per letter can
+    # split a five-letter word into four separate gestures.
+    pyautogui.mouseDown(button="left")
+    try:
+        for x, y in points[1:]:
+            pyautogui.moveTo(
+                x,
+                y,
+                duration=TRACE_DRAG_DURATION
+            )
+    finally:
+        # Always release the mouse if a move raises or the failsafe triggers.
+        pyautogui.mouseUp(button="left")
 
     time.sleep(TRACE_PAUSE_AFTER_WORD)
 
