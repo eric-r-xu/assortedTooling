@@ -584,6 +584,23 @@ def looks_like_capital_b(cleaned: Image.Image) -> bool:
     )
 
 
+def looks_like_capital_f(cleaned: Image.Image) -> bool:
+    """Distinguish StackDown's F from Tesseract's low-confidence E guess."""
+    letter = _central_letter_mask(cleaned)
+    if letter is None:
+        return False
+    left_stem = letter[:, :14].mean()
+    top_coverage = letter[:14, :].any(axis=0).mean()
+    middle_coverage = letter[22:42, :].any(axis=0).mean()
+    lower_right = letter[48:, 38:].mean()
+    return (
+        left_stem > 0.45
+        and top_coverage > 0.72
+        and middle_coverage > 0.58
+        and lower_right < 0.08
+    )
+
+
 def recognize_letter(tile_image: Image.Image) -> tuple[str, float]:
     cleaned = clean_for_ocr(tile_image)
     ink_ratio = float(np.mean(np.asarray(cleaned) < 128))
@@ -611,8 +628,12 @@ def recognize_letter(tile_image: Image.Image) -> tuple[str, float]:
         return "Z", 94.0
     if best_letter in {"?", "P", "R"} and looks_like_capital_b(cleaned):
         return "B", 95.0
-    if best_letter in {"?", "A", "F"} and looks_like_capital_p(cleaned):
+    # StackDown's F also satisfies the deliberately broad missing-P shape
+    # heuristic. Trust an explicit F from Tesseract instead of overriding it.
+    if best_letter in {"?", "A"} and looks_like_capital_p(cleaned):
         return "P", 94.0
+    if best_letter == "E" and looks_like_capital_f(cleaned):
+        return "F", 94.0
     return best_letter, best_confidence
 
 
@@ -675,7 +696,31 @@ def identify_guess_row(
             guess = bottom
     guess_ids = {id(tile) for tile in guess}
     guess = sorted(guess, key=lambda tile: tile.center[0])[:5]
+    # Availability is a set for word matching, but column-major order makes
+    # diagnostics deterministic and mirrors how exposed stack edges are read.
     visible = [tile for tile in tiles if id(tile) not in guess_ids]
+    columns: list[list[Tile]] = []
+    column_tolerance = median_height * 0.35
+    for tile in sorted(visible, key=lambda item: item.center[0]):
+        matching = next(
+            (
+                column
+                for column in columns
+                if abs(np.mean([item.center[0] for item in column]) - tile.center[0])
+                <= column_tolerance
+            ),
+            None,
+        )
+        if matching is None:
+            columns.append([tile])
+        else:
+            matching.append(tile)
+    columns.sort(key=lambda column: np.mean([tile.center[0] for tile in column]))
+    visible = [
+        tile
+        for column in columns
+        for tile in sorted(column, key=lambda item: item.center[1])
+    ]
     return guess, visible
 
 

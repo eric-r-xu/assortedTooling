@@ -69,5 +69,5 @@ with a separate stricter mask, matching the game's exposed-tile highlight.
 Small repeated contours from the printed letter glyphs are rejected before
 tile-size clustering.
 Shape fallbacks handle the game font's common `Z`→`A`, missing-`P`, round `O`,
-narrow `I`, diagonal-stem `N`, and two-bowl `B` OCR errors after a tile has
+narrow `I`, diagonal-stem `N`, two-bowl `B`, and `F`→`E` OCR errors after a tile has
 been identified.

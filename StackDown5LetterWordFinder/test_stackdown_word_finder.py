@@ -1,4 +1,8 @@
+from unittest.mock import patch
+
 from PIL import Image, ImageDraw
+
+import stackdown_word_finder
 
 from stackdown_word_finder import (
     Tile,
@@ -7,11 +11,13 @@ from stackdown_word_finder import (
     guess_prefix,
     identify_guess_row,
     looks_like_capital_b,
+    looks_like_capital_f,
     looks_like_capital_i,
     looks_like_capital_n,
     looks_like_capital_o,
     looks_like_capital_p,
     looks_like_capital_z,
+    recognize_letter,
     _same_physical_tile,
 )
 
@@ -132,6 +138,54 @@ def test_b_shape_fallback_requires_two_bowls():
 
     assert looks_like_capital_b(b_image)
     assert not looks_like_capital_b(p_image)
+
+
+def test_f_shape_fallback_rejects_e():
+    f_image = Image.new("L", (240, 240), 255)
+    draw_f = ImageDraw.Draw(f_image)
+    draw_f.line((70, 190, 70, 48), fill=0, width=24)
+    draw_f.line((70, 58, 176, 58), fill=0, width=24)
+    draw_f.line((70, 120, 154, 120), fill=0, width=22)
+
+    e_image = f_image.copy()
+    draw_e = ImageDraw.Draw(e_image)
+    draw_e.line((70, 180, 176, 180), fill=0, width=24)
+
+    assert looks_like_capital_f(f_image)
+    assert not looks_like_capital_f(e_image)
+
+
+def test_p_fallback_does_not_override_an_explicit_f():
+    # The game's F also passes the intentionally permissive P shape fallback.
+    # A positive OCR result must therefore take precedence over that fallback.
+    f_tile = Image.new("L", (240, 240), 255)
+    draw_f = ImageDraw.Draw(f_tile)
+    draw_f.line((70, 190, 70, 48), fill=0, width=24)
+    draw_f.line((70, 58, 176, 58), fill=0, width=24)
+    draw_f.line((70, 120, 154, 120), fill=0, width=22)
+
+    with patch.object(
+        stackdown_word_finder.pytesseract,
+        "image_to_data",
+        return_value={"text": ["F"], "conf": ["90"]},
+    ):
+        assert recognize_letter(f_tile) == ("F", 90.0)
+
+
+def test_visible_tiles_use_column_major_diagnostic_order():
+    visible_tiles = [
+        make_tile(20, 20, "L"),
+        make_tile(120, 70, "P"),
+        make_tile(19, 120, "N"),
+        make_tile(120, 170, "K"),
+        make_tile(21, 220, "O"),
+    ]
+    guess_tiles = [make_tile(20, 420, "F"), make_tile(70, 420, "R")]
+
+    guess, visible = identify_guess_row(visible_tiles + guess_tiles)
+
+    assert [tile.letter for tile in guess] == ["F", "R"]
+    assert [tile.letter for tile in visible] == list("LNOPK")
 
 
 def test_tile_detection_uses_color_edges_and_rounded_borders():
