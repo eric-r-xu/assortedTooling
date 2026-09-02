@@ -88,13 +88,19 @@ SAVE_ORIGINAL_TEMPLATE_IMAGE = False
 AUTO_TRACE_FOUND_WORD = True
 TRACE_ONLY_FIRST_WORD = False
 
-TRACE_MOVE_DURATION = 0.04
-TRACE_DRAG_DURATION = 0.06
-TRACE_PAUSE_AFTER_WORD = 0.20
+# These remain long enough for the game to receive each cell crossing while
+# avoiding unnecessary idle time between words.
+TRACE_MOVE_DURATION = 0.02
+TRACE_DRAG_DURATION = 0.03
+TRACE_PAUSE_AFTER_WORD = 0.10
 
 # Move mouse to top-left corner to abort pyautogui actions
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.01
+
+# MSS setup is relatively expensive. Keep one capture handle alive for the
+# capture loop instead of creating and tearing down a session every scan.
+_SCREEN_CAPTURE = None
 
 # Allow 0 because Tesseract often reads round O as zero.
 # We map 0 back to O later.
@@ -108,6 +114,7 @@ OCR_CONFIG_TEMPLATE = (
 )
 
 
+@lru_cache(maxsize=512)
 def is_english_word(word):
     return len(word) == 5 and zipf_frequency(word.lower(), "en") >= 2.5
 
@@ -433,17 +440,25 @@ def move_mouse_away_from_capture(region):
 
 
 def capture_screen_region(region):
-    with mss.MSS() as sct:
-        screenshot = sct.grab(region)
+    global _SCREEN_CAPTURE
 
-        img = Image.frombytes(
-            "RGB",
-            screenshot.size,
-            screenshot.rgb
-        )
+    if _SCREEN_CAPTURE is None:
+        _SCREEN_CAPTURE = mss.MSS()
+
+    screenshot = _SCREEN_CAPTURE.grab(region)
+    img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
 
     img = remove_red_crosshairs(img)
     return img
+
+
+def close_screen_capture():
+    """Release the reusable MSS session when the capture loop exits."""
+    global _SCREEN_CAPTURE
+
+    if _SCREEN_CAPTURE is not None:
+        _SCREEN_CAPTURE.close()
+        _SCREEN_CAPTURE = None
 
 
 def auto_crop_white_card_with_offset(img):
@@ -557,34 +572,26 @@ def otsu_threshold(gray_img):
 
     sum_total = np.dot(np.arange(256), hist)
 
-    sum_bg = 0
-    weight_bg = 0
-    max_var = 0
-    threshold = 190
+    weights_bg = np.cumsum(hist)
+    sums_bg = np.cumsum(np.arange(256) * hist)
+    weights_fg = total - weights_bg
 
-    for t in range(256):
-        weight_bg += hist[t]
+    valid = (weights_bg > 0) & (weights_fg > 0)
+    if not np.any(valid):
+        return 190
 
-        if weight_bg == 0:
-            continue
-
-        weight_fg = total - weight_bg
-
-        if weight_fg == 0:
-            break
-
-        sum_bg += t * hist[t]
-
-        mean_bg = sum_bg / weight_bg
-        mean_fg = (sum_total - sum_bg) / weight_fg
-
-        between_var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
-
-        if between_var > max_var:
-            max_var = between_var
-            threshold = t
-
-    return threshold
+    # This is the algebraically equivalent between-class variance, evaluated
+    # in one NumPy operation instead of a Python loop for every OCR cell.
+    mean_delta = (
+        sums_bg[valid] * weights_fg[valid]
+        - (sum_total - sums_bg[valid]) * weights_bg[valid]
+    )
+    between_var = (
+        mean_delta * mean_delta
+        / (weights_bg[valid] * weights_fg[valid])
+    )
+    valid_thresholds = np.flatnonzero(valid)
+    return int(valid_thresholds[np.argmax(between_var)])
 
 
 def crop_to_letter_bounds(bw_img, padding_ratio=0.18):
@@ -1225,12 +1232,17 @@ def maybe_use_template_image_match_first(cell_img):
 
     return None, None
 
-def ocr_attempt(cell_img, thresholds, psm_modes):
+def ocr_attempt(cell_img, thresholds, psm_modes, cleaned_cache=None):
     best_letter = "?"
     best_conf = -1
 
     for threshold in thresholds:
-        cleaned = clean_cell_for_ocr(cell_img, threshold=threshold)
+        if cleaned_cache is not None and threshold in cleaned_cache:
+            cleaned = cleaned_cache[threshold]
+        else:
+            cleaned = clean_cell_for_ocr(cell_img, threshold=threshold)
+            if cleaned_cache is not None:
+                cleaned_cache[threshold] = cleaned
 
         for psm in psm_modes:
             config = OCR_CONFIG_TEMPLATE.format(psm=psm)
@@ -1258,6 +1270,11 @@ def ocr_attempt(cell_img, thresholds, psm_modes):
 
 
 def ocr_single_letter(cell_img):
+    # Both OCR passes use the same Otsu cleanup in the default configuration.
+    # Keep it per-cell so fallback PSM recognition does not repeat the costly
+    # image-processing pipeline.
+    cleaned_cache = {}
+
     template_letter, template_conf = maybe_use_template_image_match_first(cell_img)
     if template_letter is not None:
         return correct_t_o_confusion(cell_img, template_letter, template_conf)
@@ -1268,7 +1285,8 @@ def ocr_single_letter(cell_img):
     letter, conf = ocr_attempt(
         cell_img,
         FAST_THRESHOLDS,
-        PSM_MODES_FAST
+        PSM_MODES_FAST,
+        cleaned_cache=cleaned_cache,
     )
 
     corrected_letter, corrected_conf = correct_t_o_confusion(cell_img, letter, conf)
@@ -1300,7 +1318,8 @@ def ocr_single_letter(cell_img):
     letter2, conf2 = ocr_attempt(
         cell_img,
         FALLBACK_THRESHOLDS,
-        PSM_MODES_FALLBACK
+        PSM_MODES_FALLBACK,
+        cleaned_cache=cleaned_cache,
     )
 
     corrected_letter2, corrected_conf2 = correct_t_o_confusion(
@@ -1537,41 +1556,43 @@ def extract_5x5_grid_from_image(img, capture_region=None):
 
 
 def find_5_letter_words(grid):
-    directions = [
-        (0, 1),
-        (0, -1),
-        (1, 0),
-        (-1, 0),
-        (1, 1),
-        (1, -1),
-        (-1, 1),
-        (-1, -1),
-    ]
+    # Scan each undirected line once. Its reverse is checked explicitly,
+    # preserving both possible word orientations while avoiding the duplicate
+    # bounds checks performed by the eight-direction implementation.
+    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
 
     results = []
 
     for r in range(GRID_SIZE):
         for c in range(GRID_SIZE):
             for dr, dc in directions:
-                word = ""
-                positions = []
+                end_r = r + dr * 4
+                end_c = c + dc * 4
+                if not (0 <= end_r < GRID_SIZE and 0 <= end_c < GRID_SIZE):
+                    continue
 
-                for i in range(5):
-                    nr = r + dr * i
-                    nc = c + dc * i
+                positions = [
+                    (r + dr * i, c + dc * i)
+                    for i in range(5)
+                ]
+                word = "".join(grid[nr][nc] for nr, nc in positions)
 
-                    if nr < 0 or nr >= GRID_SIZE or nc < 0 or nc >= GRID_SIZE:
-                        break
-
-                    word += grid[nr][nc]
-                    positions.append((nr, nc))
-
-                if len(word) == 5 and "?" not in word and is_english_word(word):
+                if "?" not in word and is_english_word(word):
                     results.append({
                         "word": word,
                         "start": positions[0],
                         "end": positions[-1],
                         "positions": positions
+                    })
+
+                reverse_word = word[::-1]
+                reverse_positions = positions[::-1]
+                if "?" not in reverse_word and is_english_word(reverse_word):
+                    results.append({
+                        "word": reverse_word,
+                        "start": reverse_positions[0],
+                        "end": reverse_positions[-1],
+                        "positions": reverse_positions
                     })
 
     unique = {}
@@ -1701,6 +1722,8 @@ def run_auto_capture():
 
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        close_screen_capture()
 
 
 if __name__ == "__main__":
