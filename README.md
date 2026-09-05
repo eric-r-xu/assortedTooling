@@ -10,6 +10,7 @@ it can be installed and run without coupling it to the others.
 | --- | --- | --- |
 | [OneWordSearchAutoPlay](OneWordSearchAutoPlay/) | Recognizes a 5×5 OneWordSearch board and optionally traces a valid word. | [README](OneWordSearchAutoPlay/README.md) |
 | [WordBlitzAutoPlay](WordBlitzAutoPlay/) | Solves connected words on a 4×4 Word Blitz-style board and optionally traces them. | [README](WordBlitzAutoPlay/README.md) |
+| [LetterGrams](LetterGrams/) | Searches for connected 5×5 crossword layouts using a rack of letters and word dictionaries with bonus square support. | [README](LetterGrams/README.md) |
 | [AutoClicker](AutoClicker/) | Saves the current pointer position and repeatedly clicks it at a configurable interval. | [README](AutoClicker/README.md) |
 
 ## Getting Started
@@ -53,6 +54,7 @@ configuration before enabling automatic input.
 ```text
 assortedTooling/
 ├── AutoClicker/
+├── LetterGrams/
 ├── OneWordSearchAutoPlay/
 └── WordBlitzAutoPlay/
 ```
