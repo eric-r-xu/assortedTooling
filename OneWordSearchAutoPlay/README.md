@@ -187,7 +187,7 @@ Most settings are near the top of `oneWordSearch_autoplay.py`.
 ### Capture timing
 
 ```python
-AUTO_CAPTURE_SECONDS = 1
+AUTO_CAPTURE_SECONDS = 0.25
 ```
 
 Controls how often the script scans the grid.
@@ -215,14 +215,20 @@ Turn this on to save detected letters for future template matching.
 ### Template matching
 
 ```python
-USE_BACKUP_IMAGE_MATCHING = False
-USE_TEMPLATE_MATCHING_FIRST = False
+USE_BACKUP_IMAGE_MATCHING = True
+USE_TEMPLATE_MATCHING_FIRST = True
 ```
 
-Template matching can improve recognition after the script has collected enough
-high-confidence letter images, but it is disabled by default because it makes
-each scan substantially slower. Enable it when OCR accuracy is more important
-than scan speed.
+Confident template matches skip Tesseract and substantially reduce scan time
+after the script has collected high-confidence letter images. Ambiguous or
+missing matches still use OCR. Set both options to `False` to use OCR only.
+Exact cell results and color-independent cleaned glyphs are cached across
+captures, so unchanged letters do not repeat recognition work even if their
+tile colors differ.
+Template matching and OCR share each cell's preprocessing, and the OCR worker
+pool remains alive between scans to avoid repeated thread startup.
+The pre-capture cursor delay is skipped when the pointer is already safely
+outside the capture region.
 
 ---
 
@@ -255,6 +261,7 @@ High-confidence images can later be used as backup templates to improve recognit
 * OCR accuracy depends on font, contrast, screen size, and capture alignment.
 * Auto-clicking depends on accurate screen coordinates, so avoid moving the game window after starting.
 * If the game UI changes after a word is traced, tracing only the first word per scan is usually safer.
+* Word-line geometry is precomputed, and recent dictionary lookups are cached across scans.
 
 ---
 

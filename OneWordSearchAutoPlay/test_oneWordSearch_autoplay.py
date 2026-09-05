@@ -199,6 +199,35 @@ class TestWordFindingAndTracing(unittest.TestCase):
             [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)],
         )
 
+    def test_scans_all_twelve_lines_in_both_directions_once(self):
+        grid = [
+            [f"{row}{col}" for col in range(autoplay.GRID_SIZE)]
+            for row in range(autoplay.GRID_SIZE)
+        ]
+
+        with patch.object(autoplay, "is_english_word", return_value=True) as check:
+            found = autoplay.find_5_letter_words(grid)
+
+        self.assertEqual(len(autoplay.WORD_LINES), 12)
+        self.assertEqual(len(found), 24)
+        self.assertEqual(check.call_count, 24)
+        self.assertEqual(
+            [tuple(item["positions"]) for item in found],
+            [
+                positions
+                for line in autoplay.WORD_LINES
+                for positions in (line, tuple(reversed(line)))
+            ],
+        )
+
+    def test_unknown_cells_skip_both_word_lookups_for_their_lines(self):
+        grid = [["?"] * autoplay.GRID_SIZE for _ in range(autoplay.GRID_SIZE)]
+
+        with patch.object(autoplay, "is_english_word") as check:
+            self.assertEqual(autoplay.find_5_letter_words(grid), [])
+
+        check.assert_not_called()
+
     def test_vertical_trace_is_one_continuous_mouse_gesture(self):
         positions = [(row, 4) for row in range(autoplay.GRID_SIZE)]
         centers = {(row, 4): (500, 100 + row * 80) for row in range(5)}
@@ -223,6 +252,216 @@ class TestWordFindingAndTracing(unittest.TestCase):
             call(500, 340, duration=autoplay.TRACE_DRAG_DURATION),
             call(500, 420, duration=autoplay.TRACE_DRAG_DURATION),
         ])
+
+
+class TestFastTemplateMatching(unittest.TestCase):
+    def test_margin_compares_different_letters_not_duplicate_templates(self):
+        templates = [
+            ("A", np.array([[1.0, 0.0]], dtype=np.float32), "a-best.png"),
+            ("A", np.array([[0.999, 0.001]], dtype=np.float32), "a-near.png"),
+            ("B", np.array([[0.90, 0.10]], dtype=np.float32), "b.png"),
+        ]
+        index = autoplay._build_backup_template_index(templates)
+        query = np.array([[1.0, 0.0]], dtype=np.float32)
+
+        with (
+            patch.object(autoplay, "load_backup_template_index", return_value=index),
+            patch.object(autoplay, "clean_cell_for_ocr", return_value=None),
+            patch.object(
+                autoplay,
+                "normalize_image_for_backup_matching",
+                return_value=query,
+            ),
+        ):
+            letter, confidence, score, path = autoplay.match_cell_with_backup_images(
+                None
+            )
+
+        self.assertEqual(letter, "A")
+        self.assertEqual(confidence, 98)
+        self.assertAlmostEqual(score, 1.0)
+        self.assertEqual(path, "a-best.png")
+
+    def test_inconclusive_template_first_result_is_reused_after_ocr(self):
+        templates = [
+            (
+                "A",
+                np.array([[0.75, np.sqrt(1.0 - 0.75 ** 2)]], dtype=np.float32),
+                "a.png",
+            ),
+            (
+                "B",
+                np.array([[0.50, np.sqrt(1.0 - 0.50 ** 2)]], dtype=np.float32),
+                "b.png",
+            ),
+        ]
+        index = autoplay._build_backup_template_index(templates)
+        query = np.array([[1.0, 0.0]], dtype=np.float32)
+        processing_cache = {}
+
+        with (
+            patch.object(autoplay, "load_backup_template_index", return_value=index),
+            patch.object(autoplay, "_get_cleaned_cell", return_value=None),
+            patch.object(
+                autoplay,
+                "normalize_image_for_backup_matching",
+                return_value=query,
+            ) as normalize,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                autoplay.maybe_use_template_image_match_first(
+                    None,
+                    processing_cache=processing_cache,
+                ),
+                (None, None),
+            )
+            self.assertEqual(
+                autoplay.maybe_use_backup_image_match(
+                    None,
+                    "?",
+                    -1,
+                    processing_cache=processing_cache,
+                ),
+                ("A", 75),
+            )
+
+        normalize.assert_called_once_with(None)
+
+
+class TestSharedCellProcessing(unittest.TestCase):
+    def test_normalized_mask_is_built_once_per_configuration(self):
+        cleaned = Image.fromarray(np.full((240, 240), 255, dtype=np.uint8))
+        processing_cache = {}
+
+        with patch.object(
+            autoplay,
+            "clean_cell_for_ocr",
+            return_value=cleaned,
+        ) as clean:
+            first = autoplay.get_normalized_letter_mask(
+                None,
+                processing_cache=processing_cache,
+            )
+            second = autoplay.get_normalized_letter_mask(
+                None,
+                processing_cache=processing_cache,
+            )
+
+        self.assertIs(first, second)
+        clean.assert_called_once_with(None, threshold="otsu")
+
+
+class TestRecognitionCache(unittest.TestCase):
+    def tearDown(self):
+        autoplay.clear_ocr_result_cache()
+
+    def test_identical_pixels_reuse_the_recognition_result(self):
+        first = Image.fromarray(np.full((20, 20, 3), 50, dtype=np.uint8))
+        identical_copy = first.copy()
+
+        with patch.object(
+            autoplay,
+            "_recognize_single_letter",
+            return_value=("A", 95),
+        ) as recognize:
+            self.assertEqual(autoplay.ocr_single_letter(first), ("A", 95))
+            self.assertEqual(
+                autoplay.ocr_single_letter(identical_copy),
+                ("A", 95),
+            )
+
+        recognize.assert_called_once()
+        self.assertIs(recognize.call_args.args[0], first)
+
+    def test_changed_glyph_is_recognized_again(self):
+        first_pixels = np.full((40, 40, 3), (30, 105, 190), dtype=np.uint8)
+        first_pixels[8:32, 18:22] = 255
+        changed_pixels = np.full(
+            (40, 40, 3),
+            (30, 105, 190),
+            dtype=np.uint8,
+        )
+        changed_pixels[18:22, 8:32] = 255
+        first = Image.fromarray(first_pixels)
+        changed = Image.fromarray(changed_pixels)
+
+        with patch.object(
+            autoplay,
+            "_recognize_single_letter",
+            side_effect=[("A", 95), ("B", 94)],
+        ) as recognize:
+            self.assertEqual(autoplay.ocr_single_letter(first), ("A", 95))
+            self.assertEqual(autoplay.ocr_single_letter(changed), ("B", 94))
+
+        self.assertEqual(recognize.call_count, 2)
+
+    def test_same_glyph_on_different_tiles_reuses_normalized_result(self):
+        first_pixels = np.full((50, 50, 3), (30, 105, 190), dtype=np.uint8)
+        changed_tile_pixels = np.full(
+            (50, 50, 3),
+            (130, 60, 180),
+            dtype=np.uint8,
+        )
+        first_pixels[12:38, 22:28] = 255
+        changed_tile_pixels[12:38, 22:28] = 255
+
+        with patch.object(
+            autoplay,
+            "_recognize_single_letter",
+            return_value=("I", 99),
+        ) as recognize:
+            self.assertEqual(
+                autoplay.ocr_single_letter(Image.fromarray(first_pixels)),
+                ("I", 99),
+            )
+            self.assertEqual(
+                autoplay.ocr_single_letter(Image.fromarray(changed_tile_pixels)),
+                ("I", 99),
+            )
+
+        recognize.assert_called_once()
+
+
+class TestOCRExecutor(unittest.TestCase):
+    def tearDown(self):
+        autoplay.close_ocr_executor()
+
+    def test_executor_is_reused(self):
+        first = autoplay.get_ocr_executor()
+        second = autoplay.get_ocr_executor()
+
+        self.assertIs(first, second)
+
+
+class TestMouseMovement(unittest.TestCase):
+    def setUp(self):
+        self.region = {"left": 200, "top": 150, "width": 500, "height": 500}
+
+    def test_already_safe_mouse_skips_move_and_settling_delay(self):
+        with (
+            patch.object(autoplay.pyautogui, "position", return_value=(900, 700)),
+            patch.object(autoplay.pyautogui, "moveTo") as move_to,
+            patch.object(autoplay.time, "sleep") as sleep,
+        ):
+            moved = autoplay.move_mouse_away_from_capture(self.region)
+
+        self.assertFalse(moved)
+        move_to.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_mouse_inside_board_is_moved_and_given_time_to_clear(self):
+        with (
+            patch.object(autoplay.pyautogui, "position", return_value=(300, 300)),
+            patch.object(autoplay.pyautogui, "size", return_value=(1440, 900)),
+            patch.object(autoplay.pyautogui, "moveTo") as move_to,
+            patch.object(autoplay.time, "sleep") as sleep,
+        ):
+            moved = autoplay.move_mouse_away_from_capture(self.region)
+
+        self.assertTrue(moved)
+        move_to.assert_called_once()
+        sleep.assert_called_once_with(0.15)
 
 if __name__ == "__main__":
     unittest.main()

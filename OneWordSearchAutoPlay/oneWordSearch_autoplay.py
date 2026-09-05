@@ -1,4 +1,6 @@
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from collections import OrderedDict
+import hashlib
 import pytesseract
 import mss
 import tkinter as tk
@@ -10,11 +12,12 @@ import pyautogui
 from datetime import datetime
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from wordfreq import zipf_frequency
 
 
 GRID_SIZE = 5
-AUTO_CAPTURE_SECONDS = 1
+AUTO_CAPTURE_SECONDS = 0.25
 
 CAPTURE_REGION = {
     "left": 200,
@@ -68,15 +71,23 @@ SAVE_FAILED_CELLS = False
 SAVE_TEMPLATE_IMAGES = False
 TEMPLATE_IMAGE_ROOT = "ocr_letter_templates_oneWordSearch"
 
-USE_BACKUP_IMAGE_MATCHING = False
-USE_TEMPLATE_MATCHING_FIRST = False
+# Confident template matches avoid starting a Tesseract process for that cell.
+# With no saved templates these settings add no recognition work and OCR runs
+# exactly as before.
+USE_BACKUP_IMAGE_MATCHING = True
+USE_TEMPLATE_MATCHING_FIRST = True
 BACKUP_IMAGE_ROOT = os.path.join(TEMPLATE_IMAGE_ROOT, "high_confidence")
 BACKUP_MATCH_WHEN_CONF_BELOW = 65
 BACKUP_MATCH_THRESHOLD = 0.72
 TEMPLATE_FIRST_MATCH_THRESHOLD = 0.78
 BACKUP_MATCH_MARGIN = 0.035
-BACKUP_MAX_TEMPLATES_PER_LETTER = 80
+# A compact index is both faster to load and sufficient for this fixed game
+# font. Ambiguous matches retain the existing Tesseract fallback.
+BACKUP_MAX_TEMPLATES_PER_LETTER = 12
 BACKUP_MATCH_IMAGE_SIZE = 96
+OCR_RESULT_CACHE_SIZE = 512
+NORMALIZED_GLYPH_CACHE_SIZE = 512
+OCR_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
 HIGH_CONFIDENCE_THRESHOLD = 80
 LOW_CONFIDENCE_THRESHOLD = 80
@@ -94,13 +105,28 @@ TRACE_MOVE_DURATION = 0.02
 TRACE_DRAG_DURATION = 0.03
 TRACE_PAUSE_AFTER_WORD = 0.10
 
-# Move mouse to top-left corner to abort pyautogui actions
+# Move mouse to top-left corner to abort pyautogui actions. Mouse events are
+# synchronous, and the explicit sleeps below provide the settling time the game
+# needs, so a 1 ms command pause avoids adding 10 ms after every point traced.
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.01
+pyautogui.PAUSE = 0.001
 
 # MSS setup is relatively expensive. Keep one capture handle alive for the
 # capture loop instead of creating and tearing down a session every scan.
 _SCREEN_CAPTURE = None
+
+# Exact cell pixels commonly repeat between captures. Cache their final result
+# so a stable board pays recognition cost only once. This is deliberately an
+# exact digest, not a perceptual hash, so visually similar letters cannot alias.
+_OCR_RESULT_CACHE = OrderedDict()
+_OCR_RESULT_CACHE_LOCK = Lock()
+_NORMALIZED_GLYPH_RESULT_CACHE = OrderedDict()
+_NORMALIZED_GLYPH_RESULT_CACHE_LOCK = Lock()
+
+# Reusing the executor avoids starting and joining eight worker threads on
+# every 250 ms capture cycle.
+_OCR_EXECUTOR = None
+_OCR_EXECUTOR_LOCK = Lock()
 
 # Allow 0 because Tesseract often reads round O as zero.
 # We map 0 back to O later.
@@ -114,9 +140,34 @@ OCR_CONFIG_TEMPLATE = (
 )
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=4096)
 def is_english_word(word):
     return len(word) == 5 and zipf_frequency(word.lower(), "en") >= 2.5
+
+
+def _build_word_lines():
+    """Build every valid five-cell line once, in the legacy scan order."""
+    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
+    lines = []
+
+    for row in range(GRID_SIZE):
+        for col in range(GRID_SIZE):
+            for row_step, col_step in directions:
+                end_row = row + row_step * (GRID_SIZE - 1)
+                end_col = col + col_step * (GRID_SIZE - 1)
+                if 0 <= end_row < GRID_SIZE and 0 <= end_col < GRID_SIZE:
+                    lines.append(tuple(
+                        (row + row_step * offset, col + col_step * offset)
+                        for offset in range(GRID_SIZE)
+                    ))
+
+    return tuple(lines)
+
+
+# Grid geometry never changes during play. Precomputing its 12 undirected
+# lines removes the nested direction/bounds work from every capture while
+# retaining the exact result order used to choose the first traced word.
+WORD_LINES = _build_word_lines()
 
 
 def show_capture_guide(region):
@@ -405,6 +456,10 @@ def point_is_outside_region(x, y, region, margin=10):
 
 
 def move_mouse_away_from_capture(region):
+    current_x, current_y = pyautogui.position()
+    if point_is_outside_region(current_x, current_y, region):
+        return False
+
     screen_w, screen_h = pyautogui.size()
 
     safe_min = 10
@@ -431,12 +486,13 @@ def move_mouse_away_from_capture(region):
         if point_is_outside_region(x, y, region):
             pyautogui.moveTo(x, y, duration=0.05)
             time.sleep(0.15)
-            return
+            return True
 
     # If the capture area somehow covers almost the whole screen, still move
     # away from the current letter area as much as possible.
     pyautogui.moveTo(safe_max_x, safe_max_y, duration=0.05)
     time.sleep(0.15)
+    return True
 
 
 def capture_screen_region(region):
@@ -717,8 +773,19 @@ def clean_cell_for_ocr(cell_img, threshold="otsu"):
     return bw
 
 
-def looks_like_capital_i(cell_img):
-    cleaned = clean_cell_for_ocr(cell_img, threshold=210)
+def _get_cleaned_cell(cell_img, threshold, processing_cache=None):
+    """Return one cleaned variant, sharing it within a cell recognition."""
+    if processing_cache is None:
+        return clean_cell_for_ocr(cell_img, threshold=threshold)
+
+    key = ("cleaned", threshold)
+    if key not in processing_cache:
+        processing_cache[key] = clean_cell_for_ocr(cell_img, threshold=threshold)
+    return processing_cache[key]
+
+
+def looks_like_capital_i(cell_img, processing_cache=None):
+    cleaned = _get_cleaned_cell(cell_img, 210, processing_cache)
     arr = np.array(cleaned)
 
     dark = arr < 80
@@ -746,15 +813,28 @@ def looks_like_capital_i(cell_img):
     return tall_enough and narrow_enough and centered and enough_dark_pixels
 
 
-def get_normalized_letter_mask(cell_img, threshold="otsu", dark_cutoff=80, size=64):
-    cleaned = clean_cell_for_ocr(cell_img, threshold=threshold)
+def get_normalized_letter_mask(
+    cell_img,
+    threshold="otsu",
+    dark_cutoff=80,
+    size=64,
+    processing_cache=None,
+):
+    cache_key = ("normalized_mask", threshold, dark_cutoff, size)
+    if processing_cache is not None and cache_key in processing_cache:
+        return processing_cache[cache_key]
+
+    cleaned = _get_cleaned_cell(cell_img, threshold, processing_cache)
     arr = np.array(cleaned)
 
     dark = arr < dark_cutoff
     ys, xs = np.where(dark)
 
     if len(xs) == 0 or len(ys) == 0:
-        return None, None
+        result = (None, None)
+        if processing_cache is not None:
+            processing_cache[cache_key] = result
+        return result
 
     x_min, x_max = xs.min(), xs.max()
     y_min, y_max = ys.min(), ys.max()
@@ -763,16 +843,22 @@ def get_normalized_letter_mask(cell_img, threshold="otsu", dark_cutoff=80, size=
     height = y_max - y_min + 1
 
     if width <= 0 or height <= 0:
-        return None, None
+        result = (None, None)
+        if processing_cache is not None:
+            processing_cache[cache_key] = result
+        return result
 
     letter = dark[y_min:y_max + 1, x_min:x_max + 1]
     letter_img = Image.fromarray((letter * 255).astype(np.uint8))
     letter_img = letter_img.resize((size, size))
 
-    return np.array(letter_img) > 0, width / height
+    result = (np.array(letter_img) > 0, width / height)
+    if processing_cache is not None:
+        processing_cache[cache_key] = result
+    return result
 
 
-def looks_like_capital_p(cell_img):
+def looks_like_capital_p(cell_img, processing_cache=None):
     """
     Backup detector for capital P.
     Helps distinguish P from F by checking:
@@ -785,7 +871,8 @@ def looks_like_capital_p(cell_img):
     letter, aspect_ratio = get_normalized_letter_mask(
         cell_img,
         threshold=190,
-        dark_cutoff=80
+        dark_cutoff=80,
+        processing_cache=processing_cache,
     )
 
     if letter is None:
@@ -861,7 +948,7 @@ def looks_like_capital_p(cell_img):
     )
 
 
-def looks_like_capital_f(cell_img):
+def looks_like_capital_f(cell_img, processing_cache=None):
     """
     Backup detector for capital F.
     It is intentionally conservative: strong left stem and top/middle bars,
@@ -870,7 +957,8 @@ def looks_like_capital_f(cell_img):
     letter, aspect_ratio = get_normalized_letter_mask(
         cell_img,
         threshold=190,
-        dark_cutoff=80
+        dark_cutoff=80,
+        processing_cache=processing_cache,
     )
 
     if letter is None:
@@ -920,11 +1008,12 @@ def looks_like_capital_f(cell_img):
     )
 
 
-def looks_like_capital_o(cell_img):
+def looks_like_capital_o(cell_img, processing_cache=None):
     letter, aspect_ratio = get_normalized_letter_mask(
         cell_img,
         threshold="otsu",
-        dark_cutoff=90
+        dark_cutoff=90,
+        processing_cache=processing_cache,
     )
 
     if letter is None:
@@ -978,7 +1067,7 @@ def looks_like_capital_o(cell_img):
     )
 
 
-def looks_like_capital_o_misread_as_t(cell_img):
+def looks_like_capital_o_misread_as_t(cell_img, processing_cache=None):
     """Distinguish a chunky O from Tesseract's occasional T prediction.
 
     The normal O detector is deliberately strict because it is also used for
@@ -989,7 +1078,8 @@ def looks_like_capital_o_misread_as_t(cell_img):
     letter, aspect_ratio = get_normalized_letter_mask(
         cell_img,
         threshold="otsu",
-        dark_cutoff=90
+        dark_cutoff=90,
+        processing_cache=processing_cache,
     )
 
     if letter is None or not (0.70 <= aspect_ratio <= 1.30):
@@ -1022,9 +1112,17 @@ def looks_like_capital_o_misread_as_t(cell_img):
     )
 
 
-def correct_t_o_confusion(cell_img, letter, confidence):
+def correct_t_o_confusion(
+    cell_img,
+    letter,
+    confidence,
+    processing_cache=None,
+):
     """Override a T result only when the pixels clearly form a closed O."""
-    if letter == "T" and looks_like_capital_o_misread_as_t(cell_img):
+    if letter == "T" and looks_like_capital_o_misread_as_t(
+        cell_img,
+        processing_cache=processing_cache,
+    ):
         return "O", 96
 
     return letter, confidence
@@ -1133,7 +1231,44 @@ def load_backup_letter_templates():
     return templates
 
 
-def match_cell_with_backup_images(cell_img):
+def _build_backup_template_index(templates):
+    """Pack templates into one matrix for a vectorized similarity pass."""
+    if not templates:
+        return None
+
+    letters = tuple(dict.fromkeys(letter for letter, _, _ in templates))
+    letter_numbers = {letter: index for index, letter in enumerate(letters)}
+    template_letter_numbers = np.fromiter(
+        (letter_numbers[letter] for letter, _, _ in templates),
+        dtype=np.intp,
+        count=len(templates),
+    )
+    matrix = np.ascontiguousarray(
+        np.stack([template.ravel() for _, template, _ in templates]),
+        dtype=np.float32,
+    )
+    paths = tuple(path for _, _, path in templates)
+    template_indexes_by_letter = tuple(
+        np.flatnonzero(template_letter_numbers == number)
+        for number in range(len(letters))
+    )
+
+    return (
+        letters,
+        matrix,
+        template_letter_numbers,
+        paths,
+        template_indexes_by_letter,
+    )
+
+
+@lru_cache(maxsize=1)
+def load_backup_template_index():
+    """Load and vectorize saved templates once for all cells and scans."""
+    return _build_backup_template_index(load_backup_letter_templates())
+
+
+def match_cell_with_backup_images(cell_img, processing_cache=None):
     """
     Try to identify a cell by comparing it to saved backup/template images.
 
@@ -1143,46 +1278,85 @@ def match_cell_with_backup_images(cell_img):
     If no good match is found:
         ("?", -1, -1, None)
     """
-    templates = load_backup_letter_templates()
+    match_cache_key = ("backup_match",)
+    if processing_cache is not None and match_cache_key in processing_cache:
+        return processing_cache[match_cache_key]
 
-    if not templates:
-        return "?", -1, -1, None
+    def remember(result):
+        if processing_cache is not None:
+            processing_cache[match_cache_key] = result
+        return result
+
+    template_index = load_backup_template_index()
+    if template_index is None:
+        return remember(("?", -1, -1, None))
+
+    (
+        letters,
+        template_matrix,
+        template_letter_numbers,
+        paths,
+        template_indexes_by_letter,
+    ) = template_index
 
     # Use the same cleaned OCR image so matching sees the letter, not the tile.
-    query_img = clean_cell_for_ocr(cell_img, threshold="otsu")
-    query = normalize_image_for_backup_matching(query_img)
+    query_cache_key = ("backup_query",)
+    if processing_cache is not None and query_cache_key in processing_cache:
+        query = processing_cache[query_cache_key]
+    else:
+        query_img = _get_cleaned_cell(cell_img, "otsu", processing_cache)
+        query = normalize_image_for_backup_matching(query_img)
+        if processing_cache is not None:
+            processing_cache[query_cache_key] = query
 
     if query is None:
-        return "?", -1, -1, None
+        return remember(("?", -1, -1, None))
 
-    best_letter = "?"
-    best_score = -1.0
-    best_path = None
+    # All templates are normalized, so the dot product is cosine similarity.
+    # einsum avoids one Python/NumPy call per saved image.
+    scores = np.einsum(
+        "ij,j->i",
+        template_matrix,
+        query.ravel(),
+        optimize=False,
+    )
 
-    second_best_score = -1.0
+    # Compare the best score for each *letter*. The previous implementation
+    # could incorrectly treat a second template of the winning letter as the
+    # runner-up, making a strong match appear ambiguous.
+    scores_by_letter = np.full(len(letters), -np.inf, dtype=np.float32)
+    np.maximum.at(scores_by_letter, template_letter_numbers, scores)
 
-    for letter, template, path in templates:
-        score = float(np.sum(query * template))
+    best_letter_number = int(np.argmax(scores_by_letter))
+    best_score = float(scores_by_letter[best_letter_number])
+    if len(scores_by_letter) > 1:
+        runner_up_scores = scores_by_letter.copy()
+        runner_up_scores[best_letter_number] = -np.inf
+        second_best_score = float(np.max(runner_up_scores))
+    else:
+        second_best_score = -1.0
 
-        if score > best_score:
-            second_best_score = best_score
-            best_letter = letter
-            best_score = score
-            best_path = path
-        elif score > second_best_score:
-            second_best_score = score
+    best_letter = letters[best_letter_number]
+    matching_indexes = template_indexes_by_letter[best_letter_number]
+    best_template_index = int(matching_indexes[np.argmax(scores[matching_indexes])])
+    best_path = paths[best_template_index]
 
     margin = best_score - second_best_score
 
     if best_score >= BACKUP_MATCH_THRESHOLD and margin >= BACKUP_MATCH_MARGIN:
         # Convert a 0-1 similarity score into a confidence-like number.
         confidence = min(98, max(70, int(round(best_score * 100))))
-        return best_letter, confidence, best_score, best_path
+        return remember((best_letter, confidence, best_score, best_path))
 
-    return "?", -1, best_score, best_path
+    return remember(("?", -1, best_score, best_path))
 
 
-def maybe_use_backup_image_match(cell_img, letter, confidence):
+def maybe_use_backup_image_match(
+    cell_img,
+    letter,
+    confidence,
+    processing_cache=None,
+):
     """
     Use template image matching after OCR only when OCR is unknown or low confidence.
     This preserves the old fallback behavior when template-first matching fails.
@@ -1194,7 +1368,8 @@ def maybe_use_backup_image_match(cell_img, letter, confidence):
         return letter, confidence
 
     backup_letter, backup_conf, backup_score, backup_path = match_cell_with_backup_images(
-        cell_img
+        cell_img,
+        processing_cache=processing_cache,
     )
 
     if backup_letter != "?":
@@ -1208,7 +1383,7 @@ def maybe_use_backup_image_match(cell_img, letter, confidence):
     return letter, confidence
 
 
-def maybe_use_template_image_match_first(cell_img):
+def maybe_use_template_image_match_first(cell_img, processing_cache=None):
     """
     Try template image matching before OCR.
 
@@ -1220,7 +1395,8 @@ def maybe_use_template_image_match_first(cell_img):
         return None, None
 
     backup_letter, backup_conf, backup_score, backup_path = match_cell_with_backup_images(
-        cell_img
+        cell_img,
+        processing_cache=processing_cache,
     )
 
     if backup_letter != "?" and backup_score >= TEMPLATE_FIRST_MATCH_THRESHOLD:
@@ -1237,12 +1413,7 @@ def ocr_attempt(cell_img, thresholds, psm_modes, cleaned_cache=None):
     best_conf = -1
 
     for threshold in thresholds:
-        if cleaned_cache is not None and threshold in cleaned_cache:
-            cleaned = cleaned_cache[threshold]
-        else:
-            cleaned = clean_cell_for_ocr(cell_img, threshold=threshold)
-            if cleaned_cache is not None:
-                cleaned_cache[threshold] = cleaned
+        cleaned = _get_cleaned_cell(cell_img, threshold, cleaned_cache)
 
         for psm in psm_modes:
             config = OCR_CONFIG_TEMPLATE.format(psm=psm)
@@ -1269,40 +1440,60 @@ def ocr_attempt(cell_img, thresholds, psm_modes, cleaned_cache=None):
     return best_letter, best_conf
 
 
-def ocr_single_letter(cell_img):
+def _recognize_single_letter(cell_img, processing_cache=None):
     # Both OCR passes use the same Otsu cleanup in the default configuration.
     # Keep it per-cell so fallback PSM recognition does not repeat the costly
     # image-processing pipeline.
-    cleaned_cache = {}
+    if processing_cache is None:
+        processing_cache = {}
 
-    template_letter, template_conf = maybe_use_template_image_match_first(cell_img)
+    template_letter, template_conf = maybe_use_template_image_match_first(
+        cell_img,
+        processing_cache=processing_cache,
+    )
     if template_letter is not None:
-        return correct_t_o_confusion(cell_img, template_letter, template_conf)
+        return correct_t_o_confusion(
+            cell_img,
+            template_letter,
+            template_conf,
+            processing_cache=processing_cache,
+        )
 
-    if looks_like_capital_i(cell_img):
+    if looks_like_capital_i(cell_img, processing_cache=processing_cache):
         return "I", 99
 
     letter, conf = ocr_attempt(
         cell_img,
         FAST_THRESHOLDS,
         PSM_MODES_FAST,
-        cleaned_cache=cleaned_cache,
+        cleaned_cache=processing_cache,
     )
 
-    corrected_letter, corrected_conf = correct_t_o_confusion(cell_img, letter, conf)
+    corrected_letter, corrected_conf = correct_t_o_confusion(
+        cell_img,
+        letter,
+        conf,
+        processing_cache=processing_cache,
+    )
     if corrected_letter != letter:
         return corrected_letter, corrected_conf
 
     if letter in {"?", "D", "C", "Q"} or conf < 70:
-        if looks_like_capital_o(cell_img):
+        if looks_like_capital_o(cell_img, processing_cache=processing_cache):
             return "O", 96
 
     if letter != "?" and conf >= 65 and letter not in {"F", "R", "D", "B", "C", "Q"}:
         return letter, conf
 
     if letter in {"?", "P", "F", "R", "D", "B"} or conf < 65:
-        looks_like_p = looks_like_capital_p(cell_img)
-        looks_like_f = looks_like_capital_f(cell_img)
+        looks_like_p = looks_like_capital_p(
+            cell_img,
+            processing_cache=processing_cache,
+        )
+        looks_like_f = looks_like_capital_f(
+            cell_img,
+            processing_cache=processing_cache,
+        )
 
         if looks_like_p:
             return "P", 96
@@ -1319,24 +1510,31 @@ def ocr_single_letter(cell_img):
         cell_img,
         FALLBACK_THRESHOLDS,
         PSM_MODES_FALLBACK,
-        cleaned_cache=cleaned_cache,
+        cleaned_cache=processing_cache,
     )
 
     corrected_letter2, corrected_conf2 = correct_t_o_confusion(
         cell_img,
         letter2,
-        conf2
+        conf2,
+        processing_cache=processing_cache,
     )
     if corrected_letter2 != letter2:
         return corrected_letter2, corrected_conf2
 
     if letter2 in {"?", "D", "C", "Q"} or conf2 < 70:
-        if looks_like_capital_o(cell_img):
+        if looks_like_capital_o(cell_img, processing_cache=processing_cache):
             return "O", 96
 
     if letter2 in {"?", "P", "F", "R", "D", "B"} or conf2 < 60:
-        looks_like_p = looks_like_capital_p(cell_img)
-        looks_like_f = looks_like_capital_f(cell_img)
+        looks_like_p = looks_like_capital_p(
+            cell_img,
+            processing_cache=processing_cache,
+        )
+        looks_like_f = looks_like_capital_f(
+            cell_img,
+            processing_cache=processing_cache,
+        )
 
         if looks_like_p:
             return "P", 96
@@ -1348,9 +1546,147 @@ def ocr_single_letter(cell_img):
             return "F", min(conf2, 70)
 
     if conf2 > conf:
-        return maybe_use_backup_image_match(cell_img, letter2, conf2)
+        return maybe_use_backup_image_match(
+            cell_img,
+            letter2,
+            conf2,
+            processing_cache=processing_cache,
+        )
 
-    return maybe_use_backup_image_match(cell_img, letter, conf)
+    return maybe_use_backup_image_match(
+        cell_img,
+        letter,
+        conf,
+        processing_cache=processing_cache,
+    )
+
+
+def clear_ocr_result_cache():
+    """Discard cached cell results, primarily for tests and live reconfiguration."""
+    with _OCR_RESULT_CACHE_LOCK:
+        _OCR_RESULT_CACHE.clear()
+    with _NORMALIZED_GLYPH_RESULT_CACHE_LOCK:
+        _NORMALIZED_GLYPH_RESULT_CACHE.clear()
+
+
+def _cell_image_cache_key(cell_img):
+    if not isinstance(cell_img, Image.Image):
+        return None
+
+    digest = hashlib.blake2b(cell_img.tobytes(), digest_size=16).digest()
+    return cell_img.mode, cell_img.size, digest
+
+
+def _normalized_glyph_cache_key(cell_img, processing_cache):
+    """Hash the color-independent cleaned glyph used by recognition."""
+    if not isinstance(cell_img, Image.Image):
+        return None
+
+    cleaned = _get_cleaned_cell(cell_img, "otsu", processing_cache)
+    packed_ink = np.packbits(np.asarray(cleaned) < 128)
+    digest = hashlib.blake2b(packed_ink.tobytes(), digest_size=16).digest()
+    return cleaned.size, digest
+
+
+def _get_lru_result(cache, lock, key):
+    if key is None:
+        return None
+
+    with lock:
+        result = cache.pop(key, None)
+        if result is not None:
+            cache[key] = result
+        return result
+
+
+def _store_lru_result(cache, lock, key, result, max_size):
+    if key is None or max_size <= 0:
+        return
+
+    with lock:
+        cache[key] = result
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+
+def ocr_single_letter(cell_img):
+    """Recognize one cell, reusing recent exact and normalized results."""
+    cache_key = _cell_image_cache_key(cell_img)
+    if cache_key is None:
+        return _recognize_single_letter(cell_img)
+
+    if OCR_RESULT_CACHE_SIZE > 0:
+        cached = _get_lru_result(
+            _OCR_RESULT_CACHE,
+            _OCR_RESULT_CACHE_LOCK,
+            cache_key,
+        )
+        if cached is not None:
+            return cached
+
+    processing_cache = {}
+    glyph_key = None
+    if NORMALIZED_GLYPH_CACHE_SIZE > 0:
+        glyph_key = _normalized_glyph_cache_key(cell_img, processing_cache)
+        glyph_cached = _get_lru_result(
+            _NORMALIZED_GLYPH_RESULT_CACHE,
+            _NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+            glyph_key,
+        )
+        if glyph_cached is not None:
+            _store_lru_result(
+                _OCR_RESULT_CACHE,
+                _OCR_RESULT_CACHE_LOCK,
+                cache_key,
+                glyph_cached,
+                OCR_RESULT_CACHE_SIZE,
+            )
+            return glyph_cached
+
+    result = _recognize_single_letter(
+        cell_img,
+        processing_cache=processing_cache,
+    )
+
+    _store_lru_result(
+        _NORMALIZED_GLYPH_RESULT_CACHE,
+        _NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+        glyph_key,
+        result,
+        NORMALIZED_GLYPH_CACHE_SIZE,
+    )
+    _store_lru_result(
+        _OCR_RESULT_CACHE,
+        _OCR_RESULT_CACHE_LOCK,
+        cache_key,
+        result,
+        OCR_RESULT_CACHE_SIZE,
+    )
+
+    return result
+
+
+def get_ocr_executor():
+    """Return the process-wide worker pool used for cell recognition."""
+    global _OCR_EXECUTOR
+
+    with _OCR_EXECUTOR_LOCK:
+        if _OCR_EXECUTOR is None:
+            _OCR_EXECUTOR = ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS)
+        return _OCR_EXECUTOR
+
+
+def close_ocr_executor():
+    """Shut down the reusable OCR worker pool."""
+    global _OCR_EXECUTOR
+
+    with _OCR_EXECUTOR_LOCK:
+        executor = _OCR_EXECUTOR
+        _OCR_EXECUTOR = None
+
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def safe_letter_folder_name(letter):
@@ -1509,35 +1845,33 @@ def extract_5x5_grid_from_image(img, capture_region=None):
     grid = [["?" for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
     confidences = [[-1 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
 
-    max_workers = min(8, os.cpu_count() or 4)
+    executor = get_ocr_executor()
+    future_map = {
+        executor.submit(ocr_single_letter, cell_img): (row, col, cell_img)
+        for row, col, cell_img in cells
+    }
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(ocr_single_letter, cell_img): (row, col, cell_img)
-            for row, col, cell_img in cells
-        }
+    for future in as_completed(future_map):
+        row, col, cell_img = future_map[future]
 
-        for future in as_completed(future_map):
-            row, col, cell_img = future_map[future]
+        try:
+            letter, conf = future.result()
+        except Exception:
+            letter, conf = "?", -1
 
-            try:
-                letter, conf = future.result()
-            except Exception:
-                letter, conf = "?", -1
+        grid[row][col] = letter
+        confidences[row][col] = conf
 
-            grid[row][col] = letter
-            confidences[row][col] = conf
+        save_letter_template_images(
+            cell_img=cell_img,
+            letter=letter,
+            confidence=conf,
+            row=row,
+            col=col
+        )
 
-            save_letter_template_images(
-                cell_img=cell_img,
-                letter=letter,
-                confidence=conf,
-                row=row,
-                col=col
-            )
-
-            if SAVE_FAILED_CELLS and (letter == "?" or conf < 30):
-                cell_img.save(f"debug_failed_cell_{row}_{col}.png")
+        if SAVE_FAILED_CELLS and (letter == "?" or conf < 30):
+            cell_img.save(f"debug_failed_cell_{row}_{col}.png")
 
     if ASK_FOR_UNKNOWN_CELLS:
         for row in range(GRID_SIZE):
@@ -1556,52 +1890,35 @@ def extract_5x5_grid_from_image(img, capture_region=None):
 
 
 def find_5_letter_words(grid):
-    # Scan each undirected line once. Its reverse is checked explicitly,
-    # preserving both possible word orientations while avoiding the duplicate
-    # bounds checks performed by the eight-direction implementation.
-    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
-
     results = []
 
-    for r in range(GRID_SIZE):
-        for c in range(GRID_SIZE):
-            for dr, dc in directions:
-                end_r = r + dr * 4
-                end_c = c + dc * 4
-                if not (0 <= end_r < GRID_SIZE and 0 <= end_c < GRID_SIZE):
-                    continue
+    for line in WORD_LINES:
+        word = "".join(grid[row][col] for row, col in line)
+        if "?" in word:
+            continue
 
-                positions = [
-                    (r + dr * i, c + dc * i)
-                    for i in range(5)
-                ]
-                word = "".join(grid[nr][nc] for nr, nc in positions)
+        if is_english_word(word):
+            positions = list(line)
+            results.append({
+                "word": word,
+                "start": positions[0],
+                "end": positions[-1],
+                "positions": positions
+            })
 
-                if "?" not in word and is_english_word(word):
-                    results.append({
-                        "word": word,
-                        "start": positions[0],
-                        "end": positions[-1],
-                        "positions": positions
-                    })
+        reverse_word = word[::-1]
+        if is_english_word(reverse_word):
+            reverse_positions = list(reversed(line))
+            results.append({
+                "word": reverse_word,
+                "start": reverse_positions[0],
+                "end": reverse_positions[-1],
+                "positions": reverse_positions
+            })
 
-                reverse_word = word[::-1]
-                reverse_positions = positions[::-1]
-                if "?" not in reverse_word and is_english_word(reverse_word):
-                    results.append({
-                        "word": reverse_word,
-                        "start": reverse_positions[0],
-                        "end": reverse_positions[-1],
-                        "positions": reverse_positions
-                    })
-
-    unique = {}
-
-    for item in results:
-        key = (item["word"], tuple(item["positions"]))
-        unique[key] = item
-
-    return list(unique.values())
+    # Each oriented path is generated exactly once, so no de-duplication pass
+    # is necessary.
+    return results
 
 
 def trace_word_on_screen(word_item, cell_centers_screen):
@@ -1663,7 +1980,12 @@ def run_auto_capture():
     global CAPTURE_REGION
 
     print("Align the guide around the full 5x5 letter card, then click Start.")
-    CAPTURE_REGION = show_capture_guide(CAPTURE_REGION)
+    # Disk loading and normalization happen while the user aligns the guide,
+    # keeping template startup work off the first scan's critical path.
+    with ThreadPoolExecutor(max_workers=1) as template_loader:
+        if USE_BACKUP_IMAGE_MATCHING:
+            template_loader.submit(load_backup_template_index)
+        CAPTURE_REGION = show_capture_guide(CAPTURE_REGION)
 
     print("\nUsing capture region:")
     print(CAPTURE_REGION)
@@ -1724,6 +2046,7 @@ def run_auto_capture():
         print("\nStopped.")
     finally:
         close_screen_capture()
+        close_ocr_executor()
 
 
 if __name__ == "__main__":
