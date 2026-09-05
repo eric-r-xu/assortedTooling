@@ -12,11 +12,19 @@ import argparse
 import heapq
 import itertools
 import re
+import sys
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    tk = None  # type: ignore
+    ttk = None  # type: ignore
 
 LETTER_VALUES = {
     "A": 1, "B": 3, "C": 3, "D": 2, "E": 1, "F": 4, "G": 2,
@@ -691,10 +699,8 @@ class LetterGramsGUI:
 
 
 def launch_gui() -> int:
-    try:
-        import tkinter as tk
-    except ImportError:
-        print("Error: Tkinter is required for GUI mode but is not available.", file=sys.stderr)
+    if tk is None or ttk is None:
+        print("Error: Tkinter is required for GUI mode but is not available on this system.", file=sys.stderr)
         return 1
 
     root = tk.Tk()
