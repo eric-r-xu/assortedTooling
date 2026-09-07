@@ -517,7 +517,7 @@ class LetterGramsGUI:
             text="⚡ Solve LetterGrams",
             font=("Helvetica", 12, "bold"),
             bg="#2E7D32",
-            fg="white",
+            fg="black",
             activebackground="#1B5E20",
             activeforeground="white",
             padx=14,
