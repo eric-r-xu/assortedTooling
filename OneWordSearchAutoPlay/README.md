@@ -160,7 +160,9 @@ Use the guide to cover the full 5x5 letter card:
 * Press `Esc` to cancel
 * Press `Ctrl+C` in the terminal to stop
 
-Move your mouse to the top-left corner of the screen to trigger the PyAutoGUI failsafe.
+Move your mouse to any corner of the screen to stop the program. The capture
+loop checks for this every cycle, so it works even when no word is currently
+being traced, and it exits cleanly rather than raising the PyAutoGUI failsafe.
 
 ---
 

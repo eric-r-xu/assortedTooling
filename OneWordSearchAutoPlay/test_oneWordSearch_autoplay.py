@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import call, patch
 
@@ -432,6 +434,104 @@ class TestOCRExecutor(unittest.TestCase):
         second = autoplay.get_ocr_executor()
 
         self.assertIs(first, second)
+
+
+class TestFailsafeCornerStop(unittest.TestCase):
+    def test_corner_pointer_is_reported_regardless_of_traced_word(self):
+        corner = autoplay.pyautogui.FAILSAFE_POINTS[0]
+
+        with patch.object(autoplay.pyautogui, "position", return_value=corner):
+            self.assertTrue(autoplay.mouse_in_failsafe_corner())
+
+    def test_pointer_away_from_every_corner_does_not_stop(self):
+        with patch.object(autoplay.pyautogui, "position", return_value=(400, 400)):
+            self.assertFalse(autoplay.mouse_in_failsafe_corner())
+
+
+class TestPersistentGlyphCache(unittest.TestCase):
+    def setUp(self):
+        autoplay.clear_ocr_result_cache()
+        self._cache_file = tempfile.NamedTemporaryFile(
+            suffix=".json",
+            delete=False,
+        )
+        self._cache_file.close()
+        self._patcher = patch.object(
+            autoplay,
+            "GLYPH_CACHE_PATH",
+            self._cache_file.name,
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        os.unlink(self._cache_file.name)
+        autoplay.clear_ocr_result_cache()
+
+    def test_confident_results_survive_a_restart_and_weak_ones_do_not(self):
+        strong_key = ((240, 240), b"\x01" * 16)
+        weak_key = ((240, 240), b"\x02" * 16)
+
+        autoplay._store_lru_result(
+            autoplay._NORMALIZED_GLYPH_RESULT_CACHE,
+            autoplay._NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+            strong_key,
+            ("A", 96),
+            autoplay.NORMALIZED_GLYPH_CACHE_SIZE,
+        )
+        autoplay._store_lru_result(
+            autoplay._NORMALIZED_GLYPH_RESULT_CACHE,
+            autoplay._NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+            weak_key,
+            ("B", 40),
+            autoplay.NORMALIZED_GLYPH_CACHE_SIZE,
+        )
+
+        autoplay.save_persistent_glyph_cache()
+        autoplay.clear_ocr_result_cache()
+        restored = autoplay.load_persistent_glyph_cache()
+
+        self.assertEqual(restored, 1)
+        self.assertEqual(
+            autoplay._get_lru_result(
+                autoplay._NORMALIZED_GLYPH_RESULT_CACHE,
+                autoplay._NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+                strong_key,
+            ),
+            ("A", 96),
+        )
+        self.assertIsNone(
+            autoplay._get_lru_result(
+                autoplay._NORMALIZED_GLYPH_RESULT_CACHE,
+                autoplay._NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+                weak_key,
+            )
+        )
+
+    def test_a_version_bump_discards_the_old_file(self):
+        key = ((240, 240), b"\x03" * 16)
+        autoplay._store_lru_result(
+            autoplay._NORMALIZED_GLYPH_RESULT_CACHE,
+            autoplay._NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+            key,
+            ("C", 99),
+            autoplay.NORMALIZED_GLYPH_CACHE_SIZE,
+        )
+        autoplay.save_persistent_glyph_cache()
+        autoplay.clear_ocr_result_cache()
+
+        with patch.object(
+            autoplay,
+            "GLYPH_CACHE_VERSION",
+            autoplay.GLYPH_CACHE_VERSION + 1,
+        ):
+            self.assertEqual(autoplay.load_persistent_glyph_cache(), 0)
+
+    def test_a_corrupt_file_is_ignored(self):
+        with open(self._cache_file.name, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+
+        self.assertEqual(autoplay.load_persistent_glyph_cache(), 0)
 
 
 class TestMouseMovement(unittest.TestCase):

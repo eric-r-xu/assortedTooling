@@ -1,6 +1,9 @@
 # Local OCR samples generated while the tool is running.
 ocr_letter_templates_oneWordSearch/
 
+# Recognition results persisted between runs so a fresh start is warm.
+.ocr_glyph_cache.json
+
 # Python and operating-system artifacts.
 __pycache__/
 *.py[cod]
