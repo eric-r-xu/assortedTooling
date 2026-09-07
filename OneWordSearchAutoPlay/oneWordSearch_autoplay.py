@@ -1,6 +1,7 @@
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from collections import OrderedDict
 import hashlib
+import json
 import pytesseract
 import mss
 import tkinter as tk
@@ -89,6 +90,26 @@ OCR_RESULT_CACHE_SIZE = 512
 NORMALIZED_GLYPH_CACHE_SIZE = 512
 OCR_MAX_WORKERS = min(8, os.cpu_count() or 4)
 
+# Recognitions are keyed by the color-independent 240x240 cleaned glyph, so a
+# result stays valid across runs. Persisting it means a fresh process starts as
+# fast as a warmed one instead of re-reading all 25 letters with the full
+# multi-pass Tesseract pipeline for the first many scans.
+PERSIST_GLYPH_CACHE = True
+GLYPH_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".ocr_glyph_cache.json",
+)
+# Bump when the recognition pipeline changes so stale results are discarded.
+GLYPH_CACHE_VERSION = 1
+# Only persist confident reads so a single misread cannot become permanent.
+GLYPH_CACHE_MIN_CONFIDENCE = 90
+
+# Never let the capture loop become a 100% busy-wait. Even when a scan overruns
+# the target cadence, yield the CPU briefly between scans so a long session does
+# not thermally throttle the machine, which is what makes a second back-to-back
+# run feel slower than the first.
+MIN_IDLE_SLEEP = 0.05
+
 HIGH_CONFIDENCE_THRESHOLD = 80
 LOW_CONFIDENCE_THRESHOLD = 80
 
@@ -105,9 +126,11 @@ TRACE_MOVE_DURATION = 0.02
 TRACE_DRAG_DURATION = 0.03
 TRACE_PAUSE_AFTER_WORD = 0.10
 
-# Move mouse to top-left corner to abort pyautogui actions. Mouse events are
-# synchronous, and the explicit sleeps below provide the settling time the game
-# needs, so a 1 ms command pause avoids adding 10 ms after every point traced.
+# Move the mouse to any screen corner to abort pyautogui actions. Mouse events
+# are synchronous, and the explicit sleeps below provide the settling time the
+# game needs, so a 1 ms command pause avoids adding 10 ms after every point
+# traced. The capture loop also checks the corner directly every cycle so the
+# stop gesture works even when no word is currently being traced.
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.001
 
@@ -1569,6 +1592,66 @@ def clear_ocr_result_cache():
         _NORMALIZED_GLYPH_RESULT_CACHE.clear()
 
 
+def load_persistent_glyph_cache():
+    """Seed the in-memory glyph cache from disk so a fresh run starts warm."""
+    if not PERSIST_GLYPH_CACHE or NORMALIZED_GLYPH_CACHE_SIZE <= 0:
+        return 0
+
+    try:
+        with open(GLYPH_CACHE_PATH, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+    except (OSError, ValueError):
+        return 0
+
+    if payload.get("version") != GLYPH_CACHE_VERSION:
+        return 0
+
+    loaded = 0
+    for record in payload.get("entries", []):
+        try:
+            width, height, hex_digest, letter, conf = record
+            key = ((int(width), int(height)), bytes.fromhex(hex_digest))
+        except (TypeError, ValueError):
+            continue
+
+        _store_lru_result(
+            _NORMALIZED_GLYPH_RESULT_CACHE,
+            _NORMALIZED_GLYPH_RESULT_CACHE_LOCK,
+            key,
+            (letter, conf),
+            NORMALIZED_GLYPH_CACHE_SIZE,
+        )
+        loaded += 1
+
+    return loaded
+
+
+def save_persistent_glyph_cache():
+    """Write confident glyph recognitions so the next run does not relearn them."""
+    if not PERSIST_GLYPH_CACHE:
+        return
+
+    with _NORMALIZED_GLYPH_RESULT_CACHE_LOCK:
+        items = list(_NORMALIZED_GLYPH_RESULT_CACHE.items())
+
+    entries = []
+    for (size, digest), (letter, conf) in items:
+        if not isinstance(letter, str) or len(letter) != 1:
+            continue
+        if conf is None or conf < GLYPH_CACHE_MIN_CONFIDENCE:
+            continue
+        entries.append([size[0], size[1], digest.hex(), letter, conf])
+
+    try:
+        with open(GLYPH_CACHE_PATH, "w", encoding="utf-8") as cache_file:
+            json.dump(
+                {"version": GLYPH_CACHE_VERSION, "entries": entries},
+                cache_file,
+            )
+    except OSError:
+        pass
+
+
 def _cell_image_cache_key(cell_img):
     if not isinstance(cell_img, Image.Image):
         return None
@@ -1976,6 +2059,20 @@ def print_grid(grid, confidences=None):
             print(" ".join(f"{int(c):2d}" for c in row))
 
 
+def mouse_in_failsafe_corner():
+    """Return True when the pointer sits in a screen corner (the stop gesture).
+
+    ``move_mouse_away_from_capture`` returns early without calling a guarded
+    pyautogui function when the pointer is already clear of the board, so on a
+    frame with no word to trace nothing else would notice the corner. Checking
+    it directly makes the stop gesture work every cycle, traced word or not.
+    """
+    try:
+        return tuple(pyautogui.position()) in pyautogui.FAILSAFE_POINTS
+    except Exception:
+        return False
+
+
 def run_auto_capture():
     global CAPTURE_REGION
 
@@ -1987,24 +2084,50 @@ def run_auto_capture():
             template_loader.submit(load_backup_template_index)
         CAPTURE_REGION = show_capture_guide(CAPTURE_REGION)
 
+    restored = load_persistent_glyph_cache()
+
     print("\nUsing capture region:")
     print(CAPTURE_REGION)
 
     print(f"\nAuto-capturing every {AUTO_CAPTURE_SECONDS} seconds.")
     print("Press Ctrl+C to stop.")
-    print("Move mouse to the top-left corner to stop pyautogui actions.")
+    print("Move the mouse to any screen corner to stop.")
+    if restored:
+        print(f"Reused {restored} letter recognitions from the last run.")
 
     if SAVE_TEMPLATE_IMAGES:
         print(f"Saving template images under: {TEMPLATE_IMAGE_ROOT}")
 
     print()
 
+    # A stable board re-scanned every cycle only reproduces the previous
+    # word-free result. Skipping the 25-cell OCR while nothing changes is the
+    # single biggest cut to sustained CPU load, which keeps the run fast.
+    last_idle_frame_signature = None
+
     try:
         while True:
             start_time = time.time()
 
+            if pyautogui.FAILSAFE and mouse_in_failsafe_corner():
+                print("\nStopped (mouse moved to a screen corner).")
+                break
+
             move_mouse_away_from_capture(CAPTURE_REGION)
             img = capture_screen_region(CAPTURE_REGION)
+
+            frame_signature = hashlib.blake2b(
+                img.tobytes(),
+                digest_size=16,
+            ).digest()
+            if frame_signature == last_idle_frame_signature:
+                time.sleep(
+                    max(
+                        MIN_IDLE_SLEEP,
+                        AUTO_CAPTURE_SECONDS - (time.time() - start_time),
+                    )
+                )
+                continue
 
             grid, confidences, cell_centers_screen = extract_5x5_grid_from_image(
                 img,
@@ -2035,16 +2158,21 @@ def run_auto_capture():
 
                 move_mouse_away_from_capture(CAPTURE_REGION)
 
+            # Only skip work on a repeat frame when the last one had nothing to
+            # trace. Tracing changes the board, so that frame must be re-scanned.
+            last_idle_frame_signature = None if words else frame_signature
+
             elapsed = time.time() - start_time
             print(f"\nScan time: {elapsed:.2f}s")
             print("-" * 40)
 
-            sleep_time = max(0, AUTO_CAPTURE_SECONDS - elapsed)
+            sleep_time = max(MIN_IDLE_SLEEP, AUTO_CAPTURE_SECONDS - elapsed)
             time.sleep(sleep_time)
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, pyautogui.FailSafeException):
         print("\nStopped.")
     finally:
+        save_persistent_glyph_cache()
         close_screen_capture()
         close_ocr_executor()
 
