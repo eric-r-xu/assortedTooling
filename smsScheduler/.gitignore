@@ -1,0 +1,8 @@
+__pycache__/
+.venv-build/
+build/
+dist/
+jobs.json
+.jobs.lock
+.wechat.lock
+logs/
